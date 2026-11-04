@@ -1,0 +1,30 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go vet ./...
+      - run: go test ./... -count=1
+      - name: Patch applies to Nitro's go-ethereum
+        run: |
+          for dir in patches/*/; do
+            tag=$(basename "$dir")
+            sha=$(gh api "repos/OffchainLabs/nitro/contents/go-ethereum?ref=${tag}" --jq .sha)
+            git init -q "/tmp/geth-${tag}"
+            git -C "/tmp/geth-${tag}" fetch -q --depth 1 https://github.com/OffchainLabs/go-ethereum.git "$sha"
+            git -C "/tmp/geth-${tag}" checkout -q FETCH_HEAD
+            for p in "$dir"go-ethereum-*.patch; do git -C "/tmp/geth-${tag}" apply "$PWD/$p"; done
+            (cd "/tmp/geth-${tag}" && go test ./core/ -run TestOpenCustomPrunedHistory -count=1)
+          done
+        env:
+          GH_TOKEN: ${{ github.token }}

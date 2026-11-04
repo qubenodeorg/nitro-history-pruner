@@ -1,0 +1,102 @@
+diff --git a/core/blockchain.go b/core/blockchain.go
+index a5439b8..1e27e68 100644
+--- a/core/blockchain.go
++++ b/core/blockchain.go
+@@ -768,11 +768,20 @@ func (bc *BlockChain) initializeHistoryPruning(latest uint64) error {
+ 		// The database was pruned somehow, so we need to figure out if it's a known
+ 		// configuration or an error.
+ 		predefinedPoint := history.PrunePoints[bc.genesisBlock.Hash()]
+-		if predefinedPoint == nil || freezerTail != predefinedPoint.BlockNumber {
+-			log.Error("Chain history database is pruned with unknown configuration", "tail", freezerTail)
++		if predefinedPoint != nil && freezerTail == predefinedPoint.BlockNumber {
++			bc.historyPrunePoint.Store(predefinedPoint)
++			return nil
++		}
++		// The history was pruned offline to an arbitrary block (for example by
++		// nitro-history-pruner). Accept it, provided the tail block's header is
++		// still present, and serve "pruned history" errors below it.
++		tailHash := rawdb.ReadCanonicalHash(bc.db, freezerTail)
++		if tailHash == (common.Hash{}) || bc.GetHeader(tailHash, freezerTail) == nil {
++			log.Error("Chain history database is pruned, but the tail header is missing", "tail", freezerTail)
+ 			return errors.New("unexpected database tail")
+ 		}
+-		bc.historyPrunePoint.Store(predefinedPoint)
++		log.Warn("Chain history is pruned to a custom point", "tail", freezerTail, "hash", tailHash)
++		bc.historyPrunePoint.Store(&history.PrunePoint{BlockNumber: freezerTail, BlockHash: tailHash})
+ 		return nil
+ 
+ 	case history.KeepPostMerge:
+diff --git a/core/blockchain_custom_prune_test.go b/core/blockchain_custom_prune_test.go
+new file mode 100644
+index 0000000..2ba1ac8
+--- /dev/null
++++ b/core/blockchain_custom_prune_test.go
+@@ -0,0 +1,68 @@
++package core
++
++import (
++	"math/big"
++	"testing"
++
++	"github.com/ethereum/go-ethereum/common"
++	"github.com/ethereum/go-ethereum/consensus/beacon"
++	"github.com/ethereum/go-ethereum/consensus/ethash"
++	"github.com/ethereum/go-ethereum/core/rawdb"
++	"github.com/ethereum/go-ethereum/core/types"
++	"github.com/ethereum/go-ethereum/crypto"
++	"github.com/ethereum/go-ethereum/params"
++)
++
++// TestOpenCustomPrunedHistory checks that a database whose ancient tail was
++// truncated offline to an arbitrary block opens in the default history mode,
++// and that the tail becomes the history pruning cutoff.
++func TestOpenCustomPrunedHistory(t *testing.T) {
++	var (
++		key, _  = crypto.HexToECDSA("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291")
++		address = crypto.PubkeyToAddress(key.PublicKey)
++		gspec   = &Genesis{
++			Config:  params.TestChainConfig,
++			Alloc:   types.GenesisAlloc{address: {Balance: big.NewInt(1e18)}},
++			BaseFee: big.NewInt(params.InitialBaseFee),
++		}
++		signer = types.LatestSigner(gspec.Config)
++		engine = beacon.New(ethash.NewFaker())
++	)
++	_, blocks, receipts := GenerateChainWithGenesis(gspec, engine, 64, func(i int, b *BlockGen) {
++		b.SetCoinbase(common.Address{1})
++		tx, _ := types.SignTx(types.NewTransaction(b.TxNonce(address), common.Address{2}, big.NewInt(1000), params.TxGas, b.header.BaseFee, nil), signer, key)
++		b.AddTx(tx)
++	})
++	db, _ := rawdb.Open(rawdb.NewMemoryDatabase(), rawdb.OpenOptions{})
++	defer db.Close()
++
++	chain, err := NewBlockChain(db, nil, gspec, engine, DefaultConfig())
++	if err != nil {
++		t.Fatal(err)
++	}
++	if _, err := chain.InsertReceiptChain(blocks, types.EncodeBlockReceiptLists(receipts), 60); err != nil {
++		t.Fatal(err)
++	}
++	chain.Stop()
++
++	const tail = 33
++	if _, err := db.TruncateTail(tail); err != nil {
++		t.Fatal(err)
++	}
++	chain, err = NewBlockChain(db, nil, gspec, engine, DefaultConfig())
++	if err != nil {
++		t.Fatalf("reopening a custom-pruned database failed: %v", err)
++	}
++	defer chain.Stop()
++
++	cutoff, hash := chain.HistoryPruningCutoff()
++	if cutoff != tail || hash != blocks[tail-1].Hash() {
++		t.Fatalf("cutoff %d %x, want %d %x", cutoff, hash, tail, blocks[tail-1].Hash())
++	}
++	if chain.GetBody(blocks[tail-2].Hash()) != nil {
++		t.Fatal("body below the cutoff should be gone")
++	}
++	if chain.GetBody(blocks[tail-1].Hash()) == nil {
++		t.Fatal("body at the cutoff should be present")
++	}
++}
