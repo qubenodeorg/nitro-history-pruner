@@ -44,6 +44,13 @@ done
 # Nitro's Dockerfile copies this file in; its CI normally creates it.
 echo "${NITRO_TAG}-pruned" > "${WORK_DIR}/.nitro-tag.txt"
 
+# Current foundryup installers no longer add ~/.foundry/bin to ~/.bashrc, so
+# the `. ~/.bashrc` in Nitro's contracts-builder stage leaves `forge` off PATH.
+# Put it on PATH explicitly (idempotent).
+git -C "${WORK_DIR}" checkout -- Dockerfile
+sed -i.bak '/foundryup -i /a ENV PATH="/root/.foundry/bin:${PATH}"' "${WORK_DIR}/Dockerfile"
+rm -f "${WORK_DIR}/Dockerfile.bak"
+
 echo ">> Building Nitro node-builder stage (slow on first run)"
 DOCKER_BUILDKIT=1 docker build \
   --target node-builder \
